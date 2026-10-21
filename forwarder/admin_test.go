@@ -275,6 +275,14 @@ func TestStoreRejectsInvalidFile(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.json")
+	os.WriteFile(path, []byte(`{"upstreams":[],"policies":[{"name":"p","upstream":"x","rules":[{"efect":"allow"}]}]}`), 0o600)
+	if _, err := OpenStore(path); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestStoreUpdateIsAtomic(t *testing.T) {
 	store, err := NewMemoryStore(&Config{})
 	if err != nil {
@@ -303,5 +311,21 @@ func TestAuditLogRing(t *testing.T) {
 	}
 	if got := a.Recent(1); len(got) != 1 || got[0].Status != 5 {
 		t.Fatalf("recent(1) = %+v", got)
+	}
+}
+
+func TestExampleConfigIsValid(t *testing.T) {
+	b, err := os.ReadFile("../examples/forwarder.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{}
+	dec := json.NewDecoder(strings.NewReader(string(b)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
 	}
 }

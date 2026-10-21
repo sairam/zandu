@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -168,8 +169,12 @@ func (s *Store) Reload() error {
 	if err != nil {
 		return err
 	}
+	// Unknown fields are rejected so that a misspelled rule field cannot
+	// silently widen a policy.
 	cfg := &Config{}
-	if err := json.Unmarshal(b, cfg); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(cfg); err != nil {
 		return fmt.Errorf("%s: %w", s.path, err)
 	}
 	snap, err := compile(cfg)

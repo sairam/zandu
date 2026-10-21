@@ -158,6 +158,7 @@ func TestProxyDenials(t *testing.T) {
 		{"path traversal", "GET", "/dynadot/x/../api3.xml?command=get_dns&domain=example.com", testToken, "", "", 403},
 		{"semicolon query", "GET", "/dynadot/api3.json?command=get_dns;domain=example.com", testToken, "", "", 400},
 		{"forbidden command in form body", "POST", "/dynadot/api3.json?command=get_dns&domain=example.com", testToken, "command=delete", "application/x-www-form-urlencoded", 403},
+		{"malformed content type", "POST", "/dynadot/api3.json?command=get_dns&domain=example.com", testToken, "command=delete", "application/x-www-form-urlencoded; =", 415},
 		{"multipart body", "POST", "/dynadot/api3.json?command=get_dns&domain=example.com", testToken, "x", "multipart/form-data; boundary=x", 415},
 	}
 	for _, c := range cases {
@@ -175,6 +176,18 @@ func TestProxyDenials(t *testing.T) {
 				t.Fatalf("status = %d, want %d, body = %s", w.Code, c.want, w.Body)
 			}
 		})
+	}
+}
+
+func TestProxyRejectsDuplicateContentType(t *testing.T) {
+	up, _ := fakeUpstream(t)
+	p, _ := newTestProxy(t, up.URL, ProxyOptions{})
+	w := do(p, "POST", "/dynadot/api3.json?command=get_dns&domain=example.com", testToken, strings.NewReader("command=delete"), func(r *http.Request) {
+		r.Header.Add("Content-Type", "text/plain")
+		r.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	})
+	if w.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d", w.Code)
 	}
 }
 

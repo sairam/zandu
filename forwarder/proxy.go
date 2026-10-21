@@ -139,8 +139,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	params := url.Values{}
 	mergeValues(params, query)
 
+	// A body the forwarder cannot classify might still be parsed as a form
+	// by a lenient upstream, so ambiguous content types are refused.
 	var body []byte
-	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	var mediaType string
+	if cts := r.Header.Values("Content-Type"); len(cts) > 1 {
+		deny(http.StatusUnsupportedMediaType, "unsupported_body", "multiple Content-Type headers")
+		return
+	} else if len(cts) == 1 {
+		if mediaType, _, err = mime.ParseMediaType(cts[0]); err != nil {
+			deny(http.StatusUnsupportedMediaType, "unsupported_body", "Content-Type could not be parsed")
+			return
+		}
+	}
 	switch mediaType {
 	case "multipart/form-data":
 		deny(http.StatusUnsupportedMediaType, "unsupported_body", "multipart bodies cannot be evaluated by policies")
@@ -192,6 +203,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if body != nil {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
+		r.TransferEncoding = nil
 	}
 
 	rp := &httputil.ReverseProxy{

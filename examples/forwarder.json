@@ -1,0 +1,101 @@
+{
+  "issuers": [
+    {
+      "name": "corp-idp",
+      "issuer": "https://login.example.com/",
+      "audience": ["zandu-forwarder"],
+      "jwks_url": "https://login.example.com/.well-known/jwks.json",
+      "subject_claim": "client_id"
+    }
+  ],
+  "upstreams": [
+    {
+      "name": "dynadot",
+      "description": "Dynadot API3",
+      "base_url": "https://api.dynadot.com",
+      "inject": {
+        "query": { "key": "vault:secret/data/registrars/dynadot#api_key" }
+      }
+    },
+    {
+      "name": "namecheap",
+      "description": "Namecheap XML API",
+      "base_url": "https://api.namecheap.com",
+      "inject": {
+        "query": {
+          "ApiUser": "file:/etc/zandu/secrets.json#namecheap.api_user",
+          "ApiKey": "file:/etc/zandu/secrets.json#namecheap.api_key",
+          "UserName": "file:/etc/zandu/secrets.json#namecheap.api_user",
+          "ClientIp": "env:NAMECHEAP_CLIENT_IP"
+        }
+      },
+      "timeout_seconds": 60
+    }
+  ],
+  "policies": [
+    {
+      "name": "dynadot-dns-example-com",
+      "description": "Read and update DNS records of example.com only.",
+      "upstream": "dynadot",
+      "rules": [
+        {
+          "effect": "allow",
+          "methods": ["GET"],
+          "path": "/api3.*",
+          "params": {
+            "command": ["domain_info", "get_dns", "set_dns2"],
+            "domain": ["example.com"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "namecheap-dns-example-com",
+      "description": "Read and update host records of example.com only.",
+      "upstream": "namecheap",
+      "rules": [
+        {
+          "effect": "allow",
+          "methods": ["GET", "POST"],
+          "path": "/xml.response",
+          "params": {
+            "Command": ["namecheap.domains.dns.getHosts", "namecheap.domains.dns.setHosts"],
+            "SLD": ["example"],
+            "TLD": ["com"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "registrar-search",
+      "description": "Availability searches on any domain except internal names.",
+      "upstream": "dynadot",
+      "rules": [
+        {
+          "effect": "allow",
+          "methods": ["GET"],
+          "path": "/api3.*",
+          "params": { "command": ["search"], "domain*": ["*"] }
+        },
+        {
+          "effect": "deny",
+          "description": "Never leak internal names to the registrar.",
+          "params": { "domain*": ["*.internal", "*.corp"] }
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "name": "cert-manager",
+      "description": "ACME DNS-01 solver; authenticates with forwarder token or IdP JWT.",
+      "identities": [{ "issuer": "corp-idp", "subject": "cert-manager" }],
+      "policies": ["dynadot-dns-example-com", "namecheap-dns-example-com"],
+      "allowed_ips": ["10.0.0.0/8"]
+    },
+    {
+      "name": "domain-search",
+      "policies": ["registrar-search"]
+    }
+  ]
+}

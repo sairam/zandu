@@ -1,0 +1,5 @@
+.git
+bin
+dist
+*.local.json
+forwarder.json
