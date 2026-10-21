@@ -27,19 +27,24 @@ var errNotFound = errors.New("not found")
 type Admin struct {
 	store *Store
 	audit *AuditLog
+	rt    *Runtime
 	token string
 	mux   *http.ServeMux
 }
 
-// NewAdmin returns the admin handler. token must not be empty.
-func NewAdmin(store *Store, audit *AuditLog, token string) *Admin {
-	a := &Admin{store: store, audit: audit, token: token, mux: http.NewServeMux()}
+// NewAdmin returns the admin handler. token must not be empty; rt should be
+// the runtime used by the proxy.
+func NewAdmin(store *Store, audit *AuditLog, rt *Runtime, token string) *Admin {
+	a := &Admin{store: store, audit: audit, rt: rt, token: token, mux: http.NewServeMux()}
 
 	ui, _ := fs.Sub(uiFiles, "ui")
 	a.mux.Handle("GET /", http.FileServerFS(ui))
 
 	a.mux.HandleFunc("GET /api/config", a.auth(a.getConfig))
+	a.mux.HandleFunc("PUT /api/issuers/{name}", a.auth(a.putIssuer))
+	a.mux.HandleFunc("DELETE /api/issuers/{name}", a.auth(a.deleteIssuer))
 	a.mux.HandleFunc("PUT /api/upstreams/{name}", a.auth(a.putUpstream))
+	a.mux.HandleFunc("POST /api/upstreams/{name}/check", a.auth(a.checkUpstream))
 	a.mux.HandleFunc("DELETE /api/upstreams/{name}", a.auth(a.deleteUpstream))
 	a.mux.HandleFunc("PUT /api/policies/{name}", a.auth(a.putPolicy))
 	a.mux.HandleFunc("DELETE /api/policies/{name}", a.auth(a.deletePolicy))
@@ -79,15 +84,17 @@ func (a *Admin) auth(next http.HandlerFunc) http.HandlerFunc {
 
 // clientView is a Client as exposed by the admin API, without its token hash.
 type clientView struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description,omitempty"`
-	Policies    []string `json:"policies"`
-	AllowedIPs  []string `json:"allowed_ips,omitempty"`
-	Disabled    bool     `json:"disabled,omitempty"`
-	HasToken    bool     `json:"has_token"`
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Identities  []Identity `json:"identities,omitempty"`
+	Policies    []string   `json:"policies"`
+	AllowedIPs  []string   `json:"allowed_ips,omitempty"`
+	Disabled    bool       `json:"disabled,omitempty"`
+	HasToken    bool       `json:"has_token"`
 }
 
 type configView struct {
+	Issuers   []Issuer     `json:"issuers"`
 	Upstreams []Upstream   `json:"upstreams"`
 	Policies  []Policy     `json:"policies"`
 	Clients   []clientView `json:"clients"`
@@ -95,10 +102,19 @@ type configView struct {
 
 func (a *Admin) getConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := a.store.Config()
-	v := configView{Upstreams: []Upstream{}, Policies: []Policy{}, Clients: []clientView{}}
+	v := configView{Issuers: []Issuer{}, Upstreams: []Upstream{}, Policies: []Policy{}, Clients: []clientView{}}
+	for _, is := range cfg.Issuers {
+		is.HMACSecret = maskSecret(is.HMACSecret)
+		v.Issuers = append(v.Issuers, is)
+	}
 	for _, u := range cfg.Upstreams {
 		u.Inject.Query = maskSecrets(u.Inject.Query)
 		u.Inject.Headers = maskSecrets(u.Inject.Headers)
+		if u.Auth != nil {
+			u.Auth.Password = maskSecret(u.Auth.Password)
+			u.Auth.Token = maskSecret(u.Auth.Token)
+			u.Auth.ClientSecret = maskSecret(u.Auth.ClientSecret)
+		}
 		v.Upstreams = append(v.Upstreams, u)
 	}
 	for _, p := range cfg.Policies {
@@ -118,9 +134,17 @@ func viewClient(c Client) clientView {
 		c.Policies = []string{}
 	}
 	return clientView{
-		Name: c.Name, Description: c.Description, Policies: c.Policies,
+		Name: c.Name, Description: c.Description, Identities: c.Identities, Policies: c.Policies,
 		AllowedIPs: c.AllowedIPs, Disabled: c.Disabled, HasToken: c.TokenHash != "",
 	}
+}
+
+// maskSecret hides literal secret values; references are shown as is.
+func maskSecret(v string) string {
+	if v == "" || isSecretRef(v) {
+		return v
+	}
+	return maskedSecret
 }
 
 func maskSecrets(m map[string]string) map[string]string {
@@ -129,13 +153,21 @@ func maskSecrets(m map[string]string) map[string]string {
 	}
 	out := make(map[string]string, len(m))
 	for k, v := range m {
-		if isSecretRef(v) {
-			out[k] = v
-		} else {
-			out[k] = maskedSecret
-		}
+		out[k] = maskSecret(v)
 	}
 	return out
+}
+
+// unmaskSecret restores the stored value of a field sent back masked.
+func unmaskSecret(field string, in *string, old string) error {
+	if *in != maskedSecret {
+		return nil
+	}
+	if old == "" {
+		return fmt.Errorf("%s has no stored value to keep", field)
+	}
+	*in = old
+	return nil
 }
 
 // unmaskSecrets restores stored values for keys sent back masked.
@@ -173,7 +205,76 @@ func (a *Admin) putUpstream(w http.ResponseWriter, r *http.Request) {
 		if u.Inject.Headers, err = unmaskSecrets(u.Inject.Headers, old.Inject.Headers); err != nil {
 			return fmt.Errorf("inject headers: %w", err)
 		}
+		if u.Auth != nil {
+			prev := UpstreamAuth{}
+			if old.Auth != nil {
+				prev = *old.Auth
+			}
+			for _, f := range []struct {
+				name     string
+				in       *string
+				previous string
+			}{
+				{"auth password", &u.Auth.Password, prev.Password},
+				{"auth token", &u.Auth.Token, prev.Token},
+				{"auth client_secret", &u.Auth.ClientSecret, prev.ClientSecret},
+			} {
+				if err := unmaskSecret(f.name, f.in, f.previous); err != nil {
+					return err
+				}
+			}
+		}
 		c.Upstreams = upsert(c.Upstreams, i, u)
+		return nil
+	})
+	a.respond(w, err, nil)
+}
+
+// checkUpstream resolves an upstream's credentials, including fetching an
+// OAuth2 token, without forwarding a request.
+func (a *Admin) checkUpstream(w http.ResponseWriter, r *http.Request) {
+	up, ok := a.store.snapshot().upstreams[r.PathValue("name")]
+	if !ok {
+		a.respond(w, errNotFound, nil)
+		return
+	}
+	if _, err := a.rt.credentials(r.Context(), &up.Upstream); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *Admin) putIssuer(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var is Issuer
+	if !readJSON(w, r, &is) {
+		return
+	}
+	is.Name = name
+	err := a.store.Update(func(c *Config) error {
+		i := indexOf(c.Issuers, func(x Issuer) bool { return x.Name == name })
+		old := ""
+		if i >= 0 {
+			old = c.Issuers[i].HMACSecret
+		}
+		if err := unmaskSecret("hmac_secret", &is.HMACSecret, old); err != nil {
+			return err
+		}
+		c.Issuers = upsert(c.Issuers, i, is)
+		return nil
+	})
+	a.respond(w, err, nil)
+}
+
+func (a *Admin) deleteIssuer(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	err := a.store.Update(func(c *Config) error {
+		var ok bool
+		c.Issuers, ok = remove(c.Issuers, func(x Issuer) bool { return x.Name == name })
+		if !ok {
+			return errNotFound
+		}
 		return nil
 	})
 	a.respond(w, err, nil)
@@ -232,7 +333,7 @@ func (a *Admin) putClient(w http.ResponseWriter, r *http.Request) {
 	err := a.store.Update(func(c *Config) error {
 		i := indexOf(c.Clients, func(x Client) bool { return x.Name == name })
 		cl := Client{
-			Name: name, Description: in.Description, Policies: in.Policies,
+			Name: name, Description: in.Description, Identities: in.Identities, Policies: in.Policies,
 			AllowedIPs: in.AllowedIPs, Disabled: in.Disabled,
 		}
 		if i >= 0 {
@@ -371,7 +472,7 @@ func (a *Admin) evaluate(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "bad_request", "parameters could not be parsed")
 			return
 		}
-		stripParams(v, up.query)
+		stripParams(v, up.Inject.Query)
 		mergeValues(params, v)
 	}
 	d := evaluate(cl.policies, name, Request{Method: in.Method, Path: clean, Params: params})

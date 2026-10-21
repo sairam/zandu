@@ -123,7 +123,7 @@ function setTab(tab) {
 function render() {
   clearInterval(state.auditTimer);
   for (const b of document.querySelectorAll("#tabs button")) b.classList.toggle("active", b.dataset.tab === state.tab);
-  const view = { clients: clientsView, policies: policiesView, upstreams: upstreamsView, test: testView, audit: auditView }[state.tab];
+  const view = { clients: clientsView, policies: policiesView, upstreams: upstreamsView, issuers: issuersView, test: testView, audit: auditView }[state.tab];
   document.getElementById("view").replaceChildren(view());
 }
 
@@ -154,13 +154,61 @@ function upstreamsView() {
         h("div", { class: "item-head" },
           h("div", {}, h("h2", {}, u.name), h("span", { class: "muted mono" }, u.base_url)),
           h("div", { class: "row" },
+            h("button", { class: "ghost", onclick: () => checkUpstream(u.name) }, "Check credentials"),
             h("button", { class: "ghost", onclick: () => { state.editing = { kind: "upstream", value: u }; render(); } }, "Edit"),
             h("button", { class: "danger", onclick: () => removeObj("upstreams", u.name) }, "Delete"))),
         u.description ? h("div", { class: "muted" }, u.description) : null,
         h("div", { class: "chips" },
+          u.auth ? h("span", { class: "chip" }, "auth: " + u.auth.type) : null,
           Object.keys(u.inject?.query || {}).map((k) => h("span", { class: "chip" }, "query: " + k)),
           Object.keys(u.inject?.headers || {}).map((k) => h("span", { class: "chip" }, "header: " + k)))),
       presets));
+}
+
+async function checkUpstream(name) {
+  const r = await run(() => api("POST", `/api/upstreams/${encodeURIComponent(name)}/check`));
+  if (r.ok) toast(`${name}: credentials resolved`);
+  else toast(`${name}: ${r.error}`, true);
+}
+
+const AUTH_FIELDS = {
+  basic: [["username", "Username"], ["password", "Password"]],
+  bearer: [["token", "Token"]],
+  oauth2_client_credentials: [["token_url", "Token URL"], ["client_id", "Client ID"], ["client_secret", "Client secret"], ["scopes", "Scopes (space-separated)"], ["audience", "Audience (optional)"]],
+};
+
+function authEditor(auth) {
+  auth = auth || {};
+  const type = h("select", { name: "auth_type" },
+    h("option", { value: "" }, "None (use injected parameters/headers only)"),
+    h("option", { value: "basic" }, "HTTP Basic"),
+    h("option", { value: "bearer" }, "Bearer token"),
+    h("option", { value: "oauth2_client_credentials" }, "OAuth2 client credentials"));
+  type.value = auth.type || "";
+  const fields = h("div", { class: "grid" });
+  const inBody = h("label", { class: "inline" }, h("input", { type: "checkbox", name: "client_auth_in_body", checked: !!auth.client_auth_in_body }), "Send client credentials in the request body");
+  const draw = () => {
+    fields.replaceChildren(...(AUTH_FIELDS[type.value] || []).map(([k, label]) =>
+      h("label", {}, label, h("input", { name: "auth_" + k, value: k === "scopes" ? (auth.scopes || []).join(" ") : (auth[k] || "") }))));
+    inBody.hidden = type.value !== "oauth2_client_credentials";
+  };
+  type.addEventListener("change", draw);
+  draw();
+  return h("fieldset", { class: "panel" }, h("legend", { class: "muted" }, "Outgoing authentication"),
+    h("label", {}, "Scheme", type), fields, inBody);
+}
+
+function readAuth(d) {
+  const type = d.get("auth_type");
+  if (!type) return null;
+  const auth = { type };
+  for (const [k] of AUTH_FIELDS[type]) {
+    const v = (d.get("auth_" + k) || "").trim();
+    if (!v) continue;
+    auth[k] = k === "scopes" ? v.split(/\s+/) : v;
+  }
+  if (type === "oauth2_client_credentials" && d.get("client_auth_in_body")) auth.client_auth_in_body = true;
+  return auth;
 }
 
 function upstreamForm(u) {
@@ -169,14 +217,15 @@ function upstreamForm(u) {
   const f = h("form", { class: "panel" },
     h("h1", {}, isNew ? "New upstream" : "Edit " + u.name),
     h("div", { class: "grid" },
-      h("label", {}, "Name", h("input", { name: "name", value: u.name, required: true, disabled: !isNew, pattern: "[a-z0-9][a-z0-9_-]*" })),
+      h("label", {}, "Name", h("input", { name: "name", value: u.name, required: true, disabled: !isNew, pattern: "[a-z0-9][a-z0-9_\\-]*" })),
       h("label", {}, "Base URL", h("input", { name: "base_url", value: u.base_url, required: true })),
       h("label", {}, "Timeout (seconds)", h("input", { name: "timeout", type: "number", min: 0, value: u.timeout_seconds || "" }))),
     h("label", {}, "Description", h("input", { name: "description", value: u.description || "" })),
-    h("p", { class: "muted" }, "Injected credentials replace any client-supplied values. Use env:NAME or file:/path to keep secrets out of the config file."),
+    h("p", { class: "muted" }, "Injected values replace any client-supplied values. Any secret may be a reference: env:NAME, file:/path, file:/path.json#key.path or vault:secret/data/app#field. References are resolved when requests are forwarded."),
     h("div", { class: "grid" },
       h("label", {}, "Query parameters (name=value per line)", h("textarea", { name: "query" }, formatPairs(u.inject?.query, "="))),
       h("label", {}, "Headers (Name: value per line)", h("textarea", { name: "headers" }, formatPairs(u.inject?.headers, ": ")))),
+    authEditor(u.auth),
     h("div", { class: "row" }, h("button", { type: "submit" }, "Save"), h("button", { type: "button", class: "ghost", onclick: () => { state.editing = null; render(); } }, "Cancel")));
   f.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -189,7 +238,59 @@ function upstreamForm(u) {
         timeout_seconds: Number(d.get("timeout")) || 0,
         inject: { query: parsePairs(d.get("query"), "="), headers: parsePairs(d.get("headers"), ":") },
       };
+      const auth = readAuth(d);
+      if (auth) body.auth = auth;
       await api("PUT", "/api/upstreams/" + encodeURIComponent(name), body);
+      await reload();
+    }, "Saved");
+    state.editing = null;
+    render();
+  });
+  return f;
+}
+
+// ---------- issuers ----------
+
+function issuersView() {
+  const c = state.config;
+  return h("div", {},
+    state.editing && state.editing.kind === "issuer" ? issuerForm(state.editing.value) : null,
+    listPanel("JWT issuers", "New issuer", () => { state.editing = { kind: "issuer", value: null }; render(); }, c.issuers, (is) =>
+      h("div", { class: "item" },
+        h("div", { class: "item-head" },
+          h("div", {}, h("h2", {}, is.name), h("span", { class: "muted mono" }, is.issuer)),
+          h("div", { class: "row" },
+            h("button", { class: "ghost", onclick: () => { state.editing = { kind: "issuer", value: is }; render(); } }, "Edit"),
+            h("button", { class: "danger", onclick: () => removeObj("issuers", is.name) }, "Delete"))),
+        h("div", { class: "chips" },
+          h("span", { class: "chip" }, is.jwks_url ? "JWKS" : "HMAC"),
+          h("span", { class: "chip" }, "client claim: " + (is.subject_claim || "sub")),
+          (is.audience || []).map((a) => h("span", { class: "chip" }, "aud: " + a)))),
+      h("span", { class: "muted" }, "Clients can authenticate with JWTs from these issuers, e.g. OAuth2 client-credentials tokens.")));
+}
+
+function issuerForm(is) {
+  const isNew = !is;
+  is = is || { name: "", issuer: "", audience: [], jwks_url: "", hmac_secret: "", subject_claim: "" };
+  const f = h("form", { class: "panel" },
+    h("h1", {}, isNew ? "New issuer" : "Edit " + is.name),
+    h("div", { class: "grid" },
+      h("label", {}, "Name", h("input", { name: "name", value: is.name, required: true, disabled: !isNew, pattern: "[a-z0-9][a-z0-9_\\-]*" })),
+      h("label", {}, "Issuer (iss claim)", h("input", { name: "issuer", value: is.issuer, required: true, placeholder: "https://login.example.com/" })),
+      h("label", {}, "Accepted audiences (comma-separated, optional)", h("input", { name: "audience", value: (is.audience || []).join(", ") })),
+      h("label", {}, "Client claim", h("input", { name: "subject_claim", value: is.subject_claim || "", placeholder: "sub" }))),
+    h("p", { class: "muted" }, "Set a JWKS URL for RS/PS/ES/EdDSA tokens, or an HMAC secret (or secret reference) for HS tokens — not both."),
+    h("div", { class: "grid" },
+      h("label", {}, "JWKS URL", h("input", { name: "jwks_url", value: is.jwks_url || "" })),
+      h("label", {}, "HMAC secret", h("input", { name: "hmac_secret", value: is.hmac_secret || "" }))),
+    h("div", { class: "row" }, h("button", { type: "submit" }, "Save"), h("button", { type: "button", class: "ghost", onclick: () => { state.editing = null; render(); } }, "Cancel")));
+  f.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const d = new FormData(f);
+    const name = isNew ? d.get("name") : is.name;
+    await run(async () => {
+      const body = { issuer: d.get("issuer").trim(), audience: csv(d.get("audience")), jwks_url: d.get("jwks_url").trim(), hmac_secret: d.get("hmac_secret").trim(), subject_claim: d.get("subject_claim").trim() };
+      await api("PUT", "/api/issuers/" + encodeURIComponent(name), body);
       await reload();
     }, "Saved");
     state.editing = null;
@@ -251,7 +352,7 @@ function policyForm(p) {
   const f = h("form", { class: "panel" },
     h("h1", {}, isNew ? "New policy" : "Edit " + p.name),
     h("div", { class: "grid" },
-      h("label", {}, "Name", h("input", { name: "name", value: p.name, required: true, disabled: !isNew, pattern: "[a-z0-9][a-z0-9_-]*" })),
+      h("label", {}, "Name", h("input", { name: "name", value: p.name, required: true, disabled: !isNew, pattern: "[a-z0-9][a-z0-9_\\-]*" })),
       h("label", {}, "Upstream", upstream)),
     h("label", {}, "Description", h("input", { name: "description", value: p.description || "" })),
     h("p", { class: "muted" }, "Requests are denied unless a rule allows them; a matching deny rule always wins. Matching is case-insensitive."),
@@ -293,6 +394,7 @@ function clientsView() {
         cl.description ? h("div", { class: "muted" }, cl.description) : null,
         h("div", { class: "chips" },
           cl.policies.map((p) => h("span", { class: "chip" }, p)),
+          (cl.identities || []).map((id) => h("span", { class: "chip mono" }, `jwt ${id.issuer}/${id.subject}`)),
           (cl.allowed_ips || []).map((ip) => h("span", { class: "chip mono" }, ip))))));
 }
 
@@ -304,7 +406,8 @@ function tokenPanel({ name, token }) {
     h("div", { class: "row" },
       h("button", { onclick: () => navigator.clipboard.writeText(token).then(() => toast("Copied")) }, "Copy"),
       h("button", { class: "ghost", onclick: () => { state.editing = null; render(); } }, "Done")),
-    h("p", { class: "muted" }, "Send it as ", h("code", {}, "Authorization: Bearer <token>"), " or ", h("code", {}, "X-Zandu-Token: <token>"), "."));
+    h("p", { class: "muted" }, "Send it as ", h("code", {}, "Authorization: Bearer <token>"), ", ", h("code", {}, "X-Zandu-Token: <token>"),
+      ", or as HTTP Basic credentials with user ", h("code", {}, name), " and the token as password."));
 }
 
 async function rotate(name) {
@@ -321,9 +424,11 @@ function clientForm(cl) {
   const f = h("form", { class: "panel" },
     h("h1", {}, isNew ? "New client" : "Edit " + cl.name),
     h("div", { class: "grid" },
-      h("label", {}, "Name", h("input", { name: "name", value: cl.name, required: true, disabled: !isNew, pattern: "[a-z0-9][a-z0-9_-]*" })),
+      h("label", {}, "Name", h("input", { name: "name", value: cl.name, required: true, disabled: !isNew, pattern: "[a-z0-9][a-z0-9_\\-]*" })),
       h("label", {}, "Allowed source IPs / CIDRs (comma-separated, empty = any)", h("input", { name: "ips", value: (cl.allowed_ips || []).join(", ") }))),
     h("label", {}, "Description", h("input", { name: "description", value: cl.description || "" })),
+    h("label", {}, "JWT identities (issuer-name subject per line; optional)",
+      h("textarea", { name: "identities", placeholder: "my-idp svc-dns-updater" }, (cl.identities || []).map((i) => `${i.issuer} ${i.subject}`).join("\n"))),
     h("fieldset", { class: "panel" }, h("legend", { class: "muted" }, "Policies"),
       state.config.policies.length ? state.config.policies.map((p) =>
         h("label", { class: "inline" }, h("input", { type: "checkbox", name: "policy", value: p.name, checked: cl.policies.includes(p.name) }), p.name, h("span", { class: "muted" }, " → " + p.upstream)))
@@ -335,7 +440,12 @@ function clientForm(cl) {
     const d = new FormData(f);
     const name = isNew ? d.get("name") : cl.name;
     const r = await run(async () => {
-      const body = { description: d.get("description"), policies: d.getAll("policy"), allowed_ips: csv(d.get("ips")), disabled: d.get("disabled") === "" || d.get("disabled") === "on" };
+      const identities = lines(d.get("identities")).map((l) => {
+        const [issuer, ...rest] = l.split(/\s+/);
+        if (!rest.length) throw new Error(`Expected "issuer subject": ${l}`);
+        return { issuer, subject: rest.join(" ") };
+      });
+      const body = { description: d.get("description"), identities, policies: d.getAll("policy"), allowed_ips: csv(d.get("ips")), disabled: d.get("disabled") === "" || d.get("disabled") === "on" };
       const res = await api("PUT", "/api/clients/" + encodeURIComponent(name), body);
       await reload();
       return res;
@@ -392,7 +502,7 @@ function auditView() {
     const rows = await api("GET", "/api/audit?limit=200").catch((e) => { toast(e.message, true); return []; });
     body.replaceChildren(...(rows.length ? rows.map((e) => h("tr", {},
       h("td", { class: "mono" }, new Date(e.time).toLocaleString()),
-      h("td", {}, e.client || "—"),
+      h("td", {}, e.client || "—", e.auth_method ? h("div", { class: "muted" }, e.auth_method) : null),
       h("td", { class: "mono" }, `${e.method} /${e.upstream || ""}${e.path}`, e.query ? h("div", { class: "muted" }, "?" + e.query) : null),
       h("td", {}, h("span", { class: "chip " + (e.allowed ? "allow" : "deny") }, e.status), h("div", { class: "muted" }, e.reason)),
       h("td", { class: "mono" }, e.remote_ip),

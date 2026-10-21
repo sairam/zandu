@@ -56,6 +56,7 @@ type options struct {
 	adminListen    string
 	trustedProxies string
 	auditSize      int
+	secretTTL      time.Duration
 }
 
 func parseFlags(name string, args []string) (*options, error) {
@@ -67,6 +68,7 @@ func parseFlags(name string, args []string) (*options, error) {
 	fs.StringVar(&o.adminListen, "admin-listen", env("ZANDU_ADMIN_LISTEN", "127.0.0.1:8081"), "admin UI listen address; empty disables it (env ZANDU_ADMIN_LISTEN)")
 	fs.StringVar(&o.trustedProxies, "trusted-proxies", env("ZANDU_TRUSTED_PROXIES", ""), "comma-separated CIDRs whose X-Forwarded-For is trusted (env ZANDU_TRUSTED_PROXIES)")
 	fs.IntVar(&o.auditSize, "audit-size", 1000, "number of recent requests kept for the audit view")
+	fs.DurationVar(&o.secretTTL, "secret-ttl", time.Minute, "how long resolved secrets are cached before they are read again")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -97,8 +99,15 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	secrets := forwarder.NewSecrets(o.secretTTL, logger)
+	if v := forwarder.VaultFromEnv(); v != nil {
+		secrets.Register("vault", v)
+		logger.Info("vault secrets enabled", "addr", v.Addr)
+	}
+	rt := forwarder.NewRuntime(secrets)
+
 	audit := forwarder.NewAuditLog(o.auditSize)
-	proxy := forwarder.NewProxy(store, audit, forwarder.ProxyOptions{TrustedProxies: trusted, Logger: logger})
+	proxy := forwarder.NewProxy(store, audit, forwarder.ProxyOptions{TrustedProxies: trusted, Runtime: rt, Logger: logger})
 
 	servers := []*http.Server{newServer(o.listen, proxy)}
 	if o.adminListen != "" {
@@ -106,7 +115,7 @@ func serve(args []string) error {
 		if len(token) < 16 {
 			return errors.New("ZANDU_ADMIN_TOKEN must be set to at least 16 characters, or disable the admin UI with -admin-listen=''")
 		}
-		servers = append(servers, newServer(o.adminListen, forwarder.NewAdmin(store, audit, token)))
+		servers = append(servers, newServer(o.adminListen, forwarder.NewAdmin(store, audit, rt, token)))
 	}
 
 	errc := make(chan error, len(servers))

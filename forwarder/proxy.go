@@ -36,7 +36,10 @@ type ProxyOptions struct {
 	// Transport is used for upstream requests. Nil means
 	// http.DefaultTransport.
 	Transport http.RoundTripper
-	Logger    *slog.Logger
+	// Runtime resolves secrets and authenticates clients. Nil means a
+	// runtime with env and file secrets cached for one minute.
+	Runtime *Runtime
+	Logger  *slog.Logger
 }
 
 // Proxy authenticates clients, evaluates policies and forwards allowed
@@ -58,6 +61,9 @@ func NewProxy(store *Store, audit *AuditLog, opts ProxyOptions) *Proxy {
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
+	}
+	if opts.Runtime == nil {
+		opts.Runtime = NewRuntime(NewSecrets(time.Minute, opts.Logger))
 	}
 	return &Proxy{store: store, audit: audit, opts: opts}
 }
@@ -81,7 +87,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		entry.DurationMS = time.Since(start).Milliseconds()
 		p.audit.Add(entry)
 		p.opts.Logger.Info("request",
-			"client", entry.Client, "upstream", entry.Upstream,
+			"client", entry.Client, "auth", entry.AuthMethod, "upstream", entry.Upstream,
 			"method", entry.Method, "path", entry.Path, "query", entry.Query,
 			"remote_ip", entry.RemoteIP, "allowed", entry.Allowed,
 			"reason", entry.Reason, "status", entry.Status,
@@ -105,9 +111,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cleanPath, fwdPath := cleanRequestPath(rest)
 	entry.Path = cleanPath
 
-	client := snap.byToken[HashToken(requestToken(r))]
-	if client == nil {
-		deny(http.StatusUnauthorized, "unauthorized", "missing or invalid client token")
+	client, method, err := p.opts.Runtime.authenticate(r.Context(), snap, r)
+	entry.AuthMethod = method
+	if err != nil {
+		// The client gets a generic message; the audit log keeps the cause.
+		rec.Header().Set("WWW-Authenticate", `Bearer realm="zandu"`)
+		writeError(rec, http.StatusUnauthorized, "unauthorized", "missing or invalid client credentials")
+		entry.Reason = err.Error()
 		return
 	}
 	entry.Client = client.name
@@ -125,7 +135,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		deny(http.StatusBadRequest, "bad_query", "query string could not be parsed")
 		return
 	}
-	stripParams(query, up.query)
+	stripParams(query, up.Inject.Query)
 	params := url.Values{}
 	mergeValues(params, query)
 
@@ -150,7 +160,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			deny(http.StatusBadRequest, "bad_body", "request body could not be parsed")
 			return
 		}
-		stripParams(form, up.query)
+		stripParams(form, up.Inject.Query)
 		mergeValues(params, form)
 		body = []byte(form.Encode())
 	}
@@ -165,17 +175,24 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for k, v := range up.query {
+	ctx, cancel := context.WithTimeout(r.Context(), up.timeout)
+	defer cancel()
+	r = r.WithContext(ctx)
+
+	creds, err := p.opts.Runtime.credentials(ctx, &up.Upstream)
+	if err != nil {
+		p.opts.Logger.Error("upstream credentials unavailable", "upstream", name, "error", err)
+		entry.Reason = decision.Reason + "; upstream credentials unavailable"
+		writeError(rec, http.StatusBadGateway, "credentials_unavailable", "upstream credentials are unavailable")
+		return
+	}
+	for k, v := range creds.query {
 		query.Set(k, v)
 	}
 	if body != nil {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), up.timeout)
-	defer cancel()
-	r = r.WithContext(ctx)
 
 	rp := &httputil.ReverseProxy{
 		Transport: p.opts.Transport,
@@ -186,9 +203,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			pr.SetURL(up.target)
 			pr.Out.Header.Del("Authorization")
 			pr.Out.Header.Del(TokenHeader)
-			for k, v := range up.headers {
+			for k, v := range creds.headers {
 				pr.Out.Header.Set(k, v)
 			}
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			if resp.StatusCode == http.StatusUnauthorized {
+				p.opts.Runtime.invalidateToken(up.Auth)
+			}
+			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			msg := "upstream request failed"
@@ -238,16 +261,6 @@ func mergeValues(dst, src url.Values) {
 	for k, vs := range src {
 		dst[k] = append(dst[k], vs...)
 	}
-}
-
-func requestToken(r *http.Request) string {
-	if t := r.Header.Get(TokenHeader); t != "" {
-		return t
-	}
-	if scheme, t, ok := strings.Cut(r.Header.Get("Authorization"), " "); ok && strings.EqualFold(scheme, "Bearer") {
-		return strings.TrimSpace(t)
-	}
-	return ""
 }
 
 func (p *Proxy) clientIP(r *http.Request) netip.Addr {

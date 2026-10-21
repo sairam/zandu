@@ -9,6 +9,7 @@ import (
 type AuditEntry struct {
 	Time       time.Time `json:"time"`
 	Client     string    `json:"client,omitempty"`
+	AuthMethod string    `json:"auth_method,omitempty"`
 	Upstream   string    `json:"upstream,omitempty"`
 	Method     string    `json:"method"`
 	Path       string    `json:"path"`

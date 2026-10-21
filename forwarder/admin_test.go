@@ -21,7 +21,8 @@ func newTestAdmin(t *testing.T) (*Admin, *Store, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewAdmin(store, NewAuditLog(10), adminToken), store, path
+	rt := NewRuntime(NewSecrets(0, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	return NewAdmin(store, NewAuditLog(10), rt, adminToken), store, path
 }
 
 func call(t *testing.T, h http.Handler, method, path, body string, out any) int {
@@ -154,15 +155,21 @@ func TestAdminCRUDAndEvaluate(t *testing.T) {
 func TestAdminApplyDynadotPreset(t *testing.T) {
 	a, store, _ := newTestAdmin(t)
 
-	// The preset references env:DYNADOT_API_KEY and is rejected without it.
-	if code := call(t, a, "POST", "/api/presets/dynadot", "", nil); code != http.StatusBadRequest {
-		t.Fatalf("preset without env: %d", code)
-	}
-
-	t.Setenv("DYNADOT_API_KEY", "k")
 	var res map[string][]string
 	if code := call(t, a, "POST", "/api/presets/dynadot", "", &res); code != http.StatusOK {
 		t.Fatalf("apply preset: %d", code)
+	}
+
+	// Secrets are resolved on use; the check endpoint reports a missing one.
+	var check map[string]any
+	call(t, a, "POST", "/api/upstreams/dynadot/check", "", &check)
+	if check["ok"] != false || !strings.Contains(check["error"].(string), "DYNADOT_API_KEY") {
+		t.Fatalf("check without env = %v", check)
+	}
+	t.Setenv("DYNADOT_API_KEY", "k")
+	call(t, a, "POST", "/api/upstreams/dynadot/check", "", &check)
+	if check["ok"] != true {
+		t.Fatalf("check with env = %v", check)
 	}
 	if len(res["added"]) != 3 {
 		t.Fatalf("added = %v", res["added"])

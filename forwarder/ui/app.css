@@ -31,6 +31,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body {
   margin: 0;
   background: var(--bg);
@@ -51,6 +52,10 @@ a { color: var(--accent); }
 }
 .brand { display: flex; align-items: center; gap: 8px; font-size: 17px; }
 nav { display: flex; gap: 4px; flex-wrap: wrap; flex: 1; }
+#logout { margin-left: auto; }
+@media (max-width: 640px) {
+  nav { order: 3; flex-basis: 100%; flex-wrap: nowrap; overflow-x: auto; }
+}
 nav button { background: transparent; color: var(--text); border-color: transparent; }
 nav button.active { background: var(--accent-soft); color: var(--accent); }
 

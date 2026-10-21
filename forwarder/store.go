@@ -41,8 +41,6 @@ func HashToken(token string) string {
 type compiledUpstream struct {
 	Upstream
 	target  *url.URL
-	query   map[string]string
-	headers map[string]string
 	timeout time.Duration
 }
 
@@ -53,12 +51,16 @@ type compiledClient struct {
 	policies   []*compiledPolicy
 }
 
-// snapshot is an immutable, compiled view of a Config.
+// snapshot is an immutable, compiled view of a Config. Secrets are not
+// resolved here but per request, so rotated values take effect without a
+// reload.
 type snapshot struct {
-	cfg       *Config
-	upstreams map[string]*compiledUpstream
-	clients   map[string]*compiledClient // keyed by name
-	byToken   map[string]*compiledClient // keyed by token hash
+	cfg        *Config
+	upstreams  map[string]*compiledUpstream
+	clients    map[string]*compiledClient // keyed by name
+	byToken    map[string]*compiledClient // keyed by token hash
+	byIdentity map[Identity]*compiledClient
+	issuers    map[string]*Issuer // keyed by "iss" claim
 }
 
 func compile(cfg *Config) (*snapshot, error) {
@@ -66,36 +68,21 @@ func compile(cfg *Config) (*snapshot, error) {
 		return nil, err
 	}
 	s := &snapshot{
-		cfg:       cfg,
-		upstreams: map[string]*compiledUpstream{},
-		clients:   map[string]*compiledClient{},
-		byToken:   map[string]*compiledClient{},
+		cfg:        cfg,
+		upstreams:  map[string]*compiledUpstream{},
+		clients:    map[string]*compiledClient{},
+		byToken:    map[string]*compiledClient{},
+		byIdentity: map[Identity]*compiledClient{},
+		issuers:    map[string]*Issuer{},
+	}
+	for i := range cfg.Issuers {
+		s.issuers[cfg.Issuers[i].Issuer] = &cfg.Issuers[i]
 	}
 	for _, u := range cfg.Upstreams {
 		target, _ := parseBaseURL(u.BaseURL)
-		cu := &compiledUpstream{
-			Upstream: u,
-			target:   target,
-			query:    map[string]string{},
-			headers:  map[string]string{},
-			timeout:  30 * time.Second,
-		}
+		cu := &compiledUpstream{Upstream: u, target: target, timeout: 30 * time.Second}
 		if u.TimeoutSeconds > 0 {
 			cu.timeout = time.Duration(u.TimeoutSeconds) * time.Second
-		}
-		for k, v := range u.Inject.Query {
-			rv, err := resolveSecret(v)
-			if err != nil {
-				return nil, fmt.Errorf("upstream %q: query %q: %w", u.Name, k, err)
-			}
-			cu.query[k] = rv
-		}
-		for k, v := range u.Inject.Headers {
-			rv, err := resolveSecret(v)
-			if err != nil {
-				return nil, fmt.Errorf("upstream %q: header %q: %w", u.Name, k, err)
-			}
-			cu.headers[k] = rv
 		}
 		s.upstreams[u.Name] = cu
 	}
@@ -116,6 +103,9 @@ func compile(cfg *Config) (*snapshot, error) {
 		s.clients[c.Name] = cc
 		if c.TokenHash != "" {
 			s.byToken[c.TokenHash] = cc
+		}
+		for _, id := range c.Identities {
+			s.byIdentity[id] = cc
 		}
 	}
 	return s, nil
