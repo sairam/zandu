@@ -213,6 +213,53 @@ func TestAdminApplyDynadotPreset(t *testing.T) {
 	}
 }
 
+func TestAdminApplyNamecheapPreset(t *testing.T) {
+	a, _, _ := newTestAdmin(t)
+	for _, k := range []string{"NAMECHEAP_API_USER", "NAMECHEAP_API_KEY", "NAMECHEAP_USERNAME", "NAMECHEAP_CLIENT_IP"} {
+		t.Setenv(k, "v")
+	}
+	var res map[string][]string
+	if code := call(t, a, "POST", "/api/presets/namecheap", "", &res); code != http.StatusOK || len(res["added"]) != 3 {
+		t.Fatalf("apply preset: %d %v", code, res)
+	}
+	call(t, a, "PUT", "/api/clients/dns", `{"policies":["namecheap-dns-example-com"]}`, nil)
+	call(t, a, "PUT", "/api/clients/ro", `{"policies":["namecheap-read-only"]}`, nil)
+
+	const base = "/namecheap/xml.response?"
+	cases := []struct {
+		client, method, url, body string
+		allowed                   bool
+	}{
+		{"dns", "GET", base + "Command=namecheap.domains.dns.getHosts&SLD=example&TLD=com", "", true},
+		{"dns", "GET", base + "command=NAMECHEAP.DOMAINS.DNS.GETHOSTS&sld=Example&tld=COM", "", true},
+		{"dns", "POST", base, "Command=namecheap.domains.dns.setHosts&SLD=example&TLD=com&HostName1=@&RecordType1=A&Address1=1.2.3.4", true},
+		{"dns", "GET", base + "Command=namecheap.domains.getInfo&DomainName=example.com", "", true},
+		{"dns", "GET", base + "Command=namecheap.domains.dns.setHosts&SLD=other&TLD=com", "", false},
+		{"dns", "GET", base + "Command=namecheap.domains.getInfo&DomainName=other.com", "", false},
+		// A forbidden command hidden in the body alongside an allowed one.
+		{"dns", "POST", base + "Command=namecheap.domains.dns.getHosts&SLD=example&TLD=com", "Command=namecheap.domains.transfer.create", false},
+		// Acting on another account under a reseller API user.
+		{"dns", "GET", base + "Command=namecheap.domains.dns.getHosts&SLD=example&TLD=com&UserName=someone-else", "", true},
+		{"ro", "GET", base + "Command=namecheap.domains.getList", "", true},
+		{"ro", "GET", base + "Command=namecheap.domains.create&DomainName=a.com", "", false},
+		{"ro", "GET", base + "Command=namecheap.domains.dns.setHosts&SLD=example&TLD=com", "", false},
+	}
+	for _, c := range cases {
+		var ev evaluateResponse
+		body, _ := json.Marshal(evaluateRequest{Client: c.client, Method: c.method, URL: c.url, Body: c.body})
+		call(t, a, "POST", "/api/evaluate", string(body), &ev)
+		if ev.Decision.Allowed != c.allowed {
+			t.Errorf("%s %s %s: allowed = %v, want %v (%s)", c.client, c.method, c.url, ev.Decision.Allowed, c.allowed, ev.Decision.Reason)
+		}
+		// Injected credentials are never taken from the client.
+		for k := range ev.Params {
+			if strings.EqualFold(k, "UserName") || strings.EqualFold(k, "ApiKey") {
+				t.Errorf("%s: client-supplied %s reached evaluation", c.url, k)
+			}
+		}
+	}
+}
+
 func TestStoreRejectsInvalidFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.json")
 	os.WriteFile(path, []byte(`{"clients":[{"name":"x","policies":["missing"]}]}`), 0o600)
